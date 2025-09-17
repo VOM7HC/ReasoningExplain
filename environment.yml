@@ -1,0 +1,25 @@
+name: reasoning-explain
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - ipykernel
+  - jupyterlab
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - pip
+  - pytest
+  - pytest-cov
+  - ruff
+  - black
+  - nbqa
+  - nbstripout
+  - pre-commit
+  - coverage
+  - pip:
+      - nbmake
+
