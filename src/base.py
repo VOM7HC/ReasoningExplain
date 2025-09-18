@@ -305,50 +305,110 @@ class BaseSHAP(ABC):
 
     def _calculate_shapley_values(self, df: pd.DataFrame, content: Any) -> Dict[str, float]:
         """
-        Port of the hand-rolled Shapley function to SHAP TreeExplainer.
-        - Learns a small tree surrogate: X = binary coalition vectors, y = Similarity.
-        - Computes TreeSHAP on all observed coalitions and averages per feature.
-        - Returns a normalized dict (sum=1), mirroring your original function's output.
+        Compute approximate Shapley values using a stacked ensemble surrogate model.
+        This replaces the single TreeSHAP surrogate with an ensemble of regressors:
+        - A base regressor on binary token coalition vectors
+        - Augmented regressors using Out-Of-Fold predictions (P) and SHAP values (SHAP)
+        - A final ensemble prediction (average of base, P, SHAP, and P+SHAP models)
+        Returns a normalized dict of token importances (sum to 1).
         """
         import numpy as np
         import pandas as pd
         from typing import Any, Dict
-        from sklearn.ensemble import GradientBoostingRegressor  # any sklearn tree model works
+        from sklearn.model_selection import KFold
+        from xgboost import XGBRegressor
         import shap
+        from scipy.sparse import csr_matrix, hstack
 
-        samples = self._get_samples(content)       # players/features in fixed order
+        samples = self._get_samples(content)  # list of tokens or features
         M = len(samples)
-
         # ---- safety checks
         if "Indexes" not in df or "Similarity" not in df:
             raise ValueError('df must have columns "Indexes" (list[int]) and "Similarity" (float).')
 
-        # ---- build design matrix X (binary presence/absence per coalition) and target y
+        # ---- build design matrix X (binary presence/absence for each coalition) and target y
         def to_binary(indexes):
             mask = np.zeros(M, dtype=int)
-            # your old code enumerated players as 1..M, keep that convention
             for idx in (indexes or []):
                 if 1 <= int(idx) <= M:
                     mask[int(idx) - 1] = 1
             return mask
 
-        X = np.vstack(df["Indexes"].apply(to_binary).values)         # shape [n_rows, M]
-        y = df["Similarity"].astype(float).values                    # shape [n_rows]
+        X = np.vstack(df["Indexes"].apply(to_binary).values)   # shape [n_coalitions, M]
+        y = df["Similarity"].astype(float).values              # shape [n_coalitions]
 
-        # ---- fit a compact tree model to approximate v(S) := Similarity
-        model = GradientBoostingRegressor(
-            random_state=0, max_depth=3, n_estimators=300, learning_rate=0.05
-        )
-        model.fit(X, y)
+        # ---- 1. Train base regressor with K-Fold to get OOF predictions and SHAP values
+        n_samples = X.shape[0]
+        oof_preds = np.zeros(n_samples)
+        oof_shap = np.zeros((n_samples, M))
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        for train_idx, val_idx in kf.split(X):
+            # Train base model on training fold
+            model_fold = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
+                                      random_state=42, objective="reg:squarederror")
+            model_fold.fit(X[train_idx], y[train_idx])
+            # Store out-of-fold predictions for validation fold
+            oof_preds[val_idx] = model_fold.predict(X[val_idx])
+            # Compute SHAP values for validation fold (using TreeExplainer on the fold model)
+            explainer_fold = shap.TreeExplainer(model_fold)
+            X_val = X[val_idx]
+            X_val_dense = X_val if isinstance(X_val, np.ndarray) else X_val.toarray()
+            shap_vals = explainer_fold.shap_values(X_val_dense)
+            # shap_values returns a list for multi-output models; for regression we get a single array
+            if isinstance(shap_vals, list):
+                shap_vals = shap_vals[0]
+            oof_shap[val_idx, :] = shap_vals
 
-        # ---- TreeExplainer (shap.Explainer auto-selects TreeExplainer for tree models)
-        explainer = shap.Explainer(model)            # -> TreeExplainer under the hood
-        exp = explainer(X)                           # SHAP for each observed coalition
+        # ---- 2. Augment original features with OOF predictions (P) and OOF SHAP values (SHAP)
+        X_sparse = csr_matrix(X)  # convert to sparse for efficient horizontal stacking
+        oof_preds_feat = csr_matrix(oof_preds.reshape(-1, 1))  # shape (n_samples, 1)
+        oof_shap_feat = csr_matrix(oof_shap)                  # shape (n_samples, M)
+        X_aug_P = hstack([X_sparse, oof_preds_feat])                   # original + OOF prediction
+        X_aug_SHAP = hstack([X_sparse, oof_shap_feat])                 # original + OOF SHAP values
+        X_aug_P_SHAP = hstack([X_sparse, oof_preds_feat, oof_shap_feat])  # original + pred + SHAP
 
-        # ---- aggregate to one vector (mean SHAP across rows; keep sign like your metric)
-        phi_mean = np.asarray(exp.values).mean(axis=0)   # shape [M]
+        # ---- 3. Train ensemble regressors on augmented features (and base on original)
+        model_base = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
+                                   random_state=42, objective="reg:squarederror")
+        model_P = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
+                                random_state=42, objective="reg:squarederror")
+        model_SHAP = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
+                                   random_state=42, objective="reg:squarederror")
+        model_P_SHAP = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
+                                     random_state=42, objective="reg:squarederror")
+        model_base.fit(X, y)
+        model_P.fit(X_aug_P, y)
+        model_SHAP.fit(X_aug_SHAP, y)
+        model_P_SHAP.fit(X_aug_P_SHAP, y)
 
-        # ---- keep your normalization style (min-shift, power, L1 normalize)
+        # ---- 4. Compute SHAP values for each observed coalition using all models
+        explainer_base = shap.TreeExplainer(model_base)
+        explainer_P = shap.TreeExplainer(model_P)
+        explainer_SHAP = shap.TreeExplainer(model_SHAP)
+        explainer_P_SHAP = shap.TreeExplainer(model_P_SHAP)
+        # Convert to dense for SHAP (if any sparse matrices)
+        X_dense = X if isinstance(X, np.ndarray) else X.toarray()
+        X_P_dense = X_aug_P.toarray() if not isinstance(X_aug_P, np.ndarray) else X_aug_P
+        X_SHAP_dense = X_aug_SHAP.toarray() if not isinstance(X_aug_SHAP, np.ndarray) else X_aug_SHAP
+        X_P_SHAP_dense = X_aug_P_SHAP.toarray() if not isinstance(X_aug_P_SHAP, np.ndarray) else X_aug_P_SHAP
+        shap_vals_base = explainer_base.shap_values(X_dense)
+        shap_vals_P = explainer_P.shap_values(X_P_dense)
+        shap_vals_SHAP = explainer_SHAP.shap_values(X_SHAP_dense)
+        shap_vals_P_SHAP = explainer_P_SHAP.shap_values(X_P_SHAP_dense)
+        # Ensure outputs are numpy arrays (for single-output XGB, shap returns an array directly)
+        shap_vals_base = np.array(shap_vals_base[0] if isinstance(shap_vals_base, list) else shap_vals_base)
+        shap_vals_P = np.array(shap_vals_P[0] if isinstance(shap_vals_P, list) else shap_vals_P)
+        shap_vals_SHAP = np.array(shap_vals_SHAP[0] if isinstance(shap_vals_SHAP, list) else shap_vals_SHAP)
+        shap_vals_P_SHAP = np.array(shap_vals_P_SHAP[0] if isinstance(shap_vals_P_SHAP, list) else shap_vals_P_SHAP)
+
+        # ---- 5. Aggregate SHAP values from ensemble (average contributions of original features)
+        phi_base = shap_vals_base.mean(axis=0)               # shap contributions from base model
+        phi_P = shap_vals_P[:, :M].mean(axis=0)              # contributions from original features in P model
+        phi_SHAP = shap_vals_SHAP[:, :M].mean(axis=0)        # contributions from original features in SHAP model
+        phi_P_SHAP = shap_vals_P_SHAP[:, :M].mean(axis=0)    # contributions from original features in P+SHAP model
+        phi_mean = (phi_base + phi_P + phi_SHAP + phi_P_SHAP) / 4.0  # ensemble average contribution
+
+        # ---- 6. Normalize Shapley values (min shift, optional power, then L1 normalize to sum=1)
         def normalize_shapley_values(values: Dict[str, float], power: float = 1.0) -> Dict[str, float]:
             min_value = min(values.values()) if values else 0.0
             shifted = {k: v - min_value for k, v in values.items()}
@@ -356,10 +416,9 @@ class BaseSHAP(ABC):
             tot = sum(powered.values())
             if tot == 0:
                 n = max(len(powered), 1)
-                return {k: 1.0 / n for k in powered}
+                return {k: 1.0 / n for k, v in powered.items()}
             return {k: v / tot for k, v in powered.items()}
 
-        # ---- map back to your original "{sample}_{i}" keys
         shapley_values_raw = {f"{samples[i]}_{i+1}": float(phi_mean[i]) for i in range(M)}
         return normalize_shapley_values(shapley_values_raw)
 
