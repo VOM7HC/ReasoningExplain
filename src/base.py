@@ -18,11 +18,6 @@ def default_output_handler(message: str) -> None:
     """Prints messages without newline."""
     print(message, end='', flush=True)
 
-def encode_image_to_base64(image_path: str) -> str:
-    """Encode image to base64 string"""
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
-
 def interact_with_ollama(
     prompt: Optional[str] = None, 
     messages: Optional[Any] = None,
@@ -305,28 +300,34 @@ class BaseSHAP(ABC):
 
     def _calculate_shapley_values(self, df: pd.DataFrame, content: Any) -> Dict[str, float]:
         """
-        Compute approximate Shapley values using a stacked ensemble surrogate model.
-        This replaces the single TreeSHAP surrogate with an ensemble of regressors:
-        - A base regressor on binary token coalition vectors
-        - Augmented regressors using Out-Of-Fold predictions (P) and SHAP values (SHAP)
-        - A final ensemble prediction (average of base, P, SHAP, and P+SHAP models)
-        Returns a normalized dict of token importances (sum to 1).
+        Compute token-level Shapley values using a two-stage ensemble learning approach (SFA method):
+        - Stage 1: Train a first-stage model via K-fold CV on binary coalition vectors (token subsets) with 
+          `Similarity` as the target. Collect out-of-fold (OOF) predictions and TreeSHAP values for each coalition.
+        - Stage 2: Augment original features with OOF predictions (P) and with SHAP values (SHAP) to form three 
+          feature sets: original+P, original+SHAP, original+P+SHAP. Train an XGBoost regressor on each augmented set.
+        - For each second-stage model (P, SHAP, P+SHAP), compute SHAP values on the training data and average the 
+          token-level contributions across all models.
+        - Hyperparameters for all models (base and second-stage) are tuned with Optuna (e.g., 20 trials per model for speed).
+        - Returns a normalized dict of token Shapley values (sum to 1), similar to the original output format.
         """
         import numpy as np
         import pandas as pd
         from typing import Any, Dict
-        from sklearn.model_selection import KFold
-        from xgboost import XGBRegressor
+        from sklearn.model_selection import KFold, train_test_split
+        from sklearn.metrics import mean_squared_error
+        import optuna
         import shap
-        from scipy.sparse import csr_matrix, hstack
+        from xgboost import XGBRegressor
 
-        samples = self._get_samples(content)  # list of tokens or features
+        # Get token list and number of features (tokens)
+        samples = self._get_samples(content)  # list of tokens in fixed order
         M = len(samples)
-        # ---- safety checks
+
+        # Safety checks on DataFrame
         if "Indexes" not in df or "Similarity" not in df:
             raise ValueError('df must have columns "Indexes" (list[int]) and "Similarity" (float).')
 
-        # ---- build design matrix X (binary presence/absence for each coalition) and target y
+        # Build design matrix X (binary presence/absence per coalition) and target y
         def to_binary(indexes):
             mask = np.zeros(M, dtype=int)
             for idx in (indexes or []):
@@ -334,81 +335,109 @@ class BaseSHAP(ABC):
                     mask[int(idx) - 1] = 1
             return mask
 
-        X = np.vstack(df["Indexes"].apply(to_binary).values)   # shape [n_coalitions, M]
-        y = df["Similarity"].astype(float).values              # shape [n_coalitions]
+        X = np.vstack(df["Indexes"].apply(to_binary).values)   # shape [n_samples, M]
+        y = df["Similarity"].astype(float).values             # shape [n_samples]
 
-        # ---- 1. Train base regressor with K-Fold to get OOF predictions and SHAP values
         n_samples = X.shape[0]
+
+        # Helper function for hyperparameter tuning with Optuna
+        def tune_model(X_data, y_data, n_trials=20):
+            # Split data for tuning (20% validation)
+            X_tune, X_val, y_tune, y_val = train_test_split(X_data, y_data, test_size=0.2, random_state=42)
+            # Convert to dense if needed (for small datasets, dense is fine)
+            X_tune_dense = X_tune.toarray() if hasattr(X_tune, 'toarray') else X_tune
+            X_val_dense = X_val.toarray() if hasattr(X_val, 'toarray') else X_val
+
+            def objective(trial):
+                params = {
+                    "objective": "reg:squarederror",
+                    "eval_metric": "rmse",
+                    "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                    "max_depth": trial.suggest_int("max_depth", 3, 10),
+                    "n_estimators": trial.suggest_int("n_estimators", 100, 500),
+                    "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                    "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                    "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                    "tree_method": "auto"
+                }
+                model = XGBRegressor(**params, random_state=42)
+                model.fit(
+                    X_tune_dense, y_tune,
+                    eval_set=[(X_val_dense, y_val)],
+                    verbose=False
+                )
+                preds = model.predict(X_val_dense)
+                rmse = np.sqrt(mean_squared_error(y_val, preds))
+                return rmse
+
+            study = optuna.create_study(direction="minimize")
+            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+            best_params = study.best_params
+            # Ensure required params are set
+            best_params.update({"objective": "reg:squarederror", "eval_metric": "rmse"})
+            return best_params
+
+        # --- Stage 1: Tune and train base model with KFold for OOF predictions ---
+        best_params_base = tune_model(X, y, n_trials=20)
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
         oof_preds = np.zeros(n_samples)
         oof_shap = np.zeros((n_samples, M))
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
         for train_idx, val_idx in kf.split(X):
-            # Train base model on training fold
-            model_fold = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
-                                      random_state=42, objective="reg:squarederror")
-            model_fold.fit(X[train_idx], y[train_idx])
-            # Store out-of-fold predictions for validation fold
-            oof_preds[val_idx] = model_fold.predict(X[val_idx])
-            # Compute SHAP values for validation fold (using TreeExplainer on the fold model)
+            X_train_fold, y_train_fold = X[train_idx], y[train_idx]
+            X_val_fold, y_val_fold = X[val_idx], y[val_idx]
+            model_fold = XGBRegressor(**best_params_base, random_state=42)
+            model_fold.fit(X_train_fold, y_train_fold, verbose=False)
+            # Out-of-fold predictions
+            oof_preds[val_idx] = model_fold.predict(X_val_fold)
+            # Compute SHAP values for validation fold
             explainer_fold = shap.TreeExplainer(model_fold)
-            X_val = X[val_idx]
-            X_val_dense = X_val if isinstance(X_val, np.ndarray) else X_val.toarray()
-            shap_vals = explainer_fold.shap_values(X_val_dense)
-            # shap_values returns a list for multi-output models; for regression we get a single array
-            if isinstance(shap_vals, list):
-                shap_vals = shap_vals[0]
-            oof_shap[val_idx, :] = shap_vals
+            X_val_dense = X_val_fold if not hasattr(X_val_fold, 'toarray') else X_val_fold.toarray()
+            # shap_values returns a single array for regression
+            shap_values_fold = explainer_fold.shap_values(X_val_dense)
+            oof_shap[val_idx, :] = shap_values_fold
 
-        # ---- 2. Augment original features with OOF predictions (P) and OOF SHAP values (SHAP)
-        X_sparse = csr_matrix(X)  # convert to sparse for efficient horizontal stacking
-        oof_preds_feat = csr_matrix(oof_preds.reshape(-1, 1))  # shape (n_samples, 1)
-        oof_shap_feat = csr_matrix(oof_shap)                  # shape (n_samples, M)
-        X_aug_P = hstack([X_sparse, oof_preds_feat])                   # original + OOF prediction
-        X_aug_SHAP = hstack([X_sparse, oof_shap_feat])                 # original + OOF SHAP values
-        X_aug_P_SHAP = hstack([X_sparse, oof_preds_feat, oof_shap_feat])  # original + pred + SHAP
+        # --- Stage 2: Augment features with OOF predictions and SHAP, then tune/train second-stage models ---
+        # Create augmented feature matrices
+        # (use scipy.sparse if memory is a concern; here using dense for simplicity)
+        oof_preds_feat = oof_preds.reshape(-1, 1)                    # shape (n_samples, 1)
+        X_aug_P = np.hstack([X, oof_preds_feat])                     # original features + OOF prediction
+        X_aug_SHAP = np.hstack([X, oof_shap])                        # original + SHAP values
+        X_aug_P_SHAP = np.hstack([X, oof_preds_feat, oof_shap])      # original + OOF pred + SHAP values
 
-        # ---- 3. Train ensemble regressors on augmented features (and base on original)
-        model_base = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
-                                   random_state=42, objective="reg:squarederror")
-        model_P = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
-                                random_state=42, objective="reg:squarederror")
-        model_SHAP = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
-                                   random_state=42, objective="reg:squarederror")
-        model_P_SHAP = XGBRegressor(max_depth=3, n_estimators=300, learning_rate=0.05,
-                                     random_state=42, objective="reg:squarederror")
-        model_base.fit(X, y)
-        model_P.fit(X_aug_P, y)
-        model_SHAP.fit(X_aug_SHAP, y)
-        model_P_SHAP.fit(X_aug_P_SHAP, y)
+        # Tune hyperparameters for each second-stage model
+        best_params_P = tune_model(X_aug_P, y, n_trials=20)
+        best_params_SHAP = tune_model(X_aug_SHAP, y, n_trials=20)
+        best_params_P_SHAP = tune_model(X_aug_P_SHAP, y, n_trials=20)
 
-        # ---- 4. Compute SHAP values for each observed coalition using all models
-        explainer_base = shap.TreeExplainer(model_base)
-        explainer_P = shap.TreeExplainer(model_P)
-        explainer_SHAP = shap.TreeExplainer(model_SHAP)
-        explainer_P_SHAP = shap.TreeExplainer(model_P_SHAP)
-        # Convert to dense for SHAP (if any sparse matrices)
-        X_dense = X if isinstance(X, np.ndarray) else X.toarray()
-        X_P_dense = X_aug_P.toarray() if not isinstance(X_aug_P, np.ndarray) else X_aug_P
-        X_SHAP_dense = X_aug_SHAP.toarray() if not isinstance(X_aug_SHAP, np.ndarray) else X_aug_SHAP
-        X_P_SHAP_dense = X_aug_P_SHAP.toarray() if not isinstance(X_aug_P_SHAP, np.ndarray) else X_aug_P_SHAP
-        shap_vals_base = explainer_base.shap_values(X_dense)
-        shap_vals_P = explainer_P.shap_values(X_P_dense)
-        shap_vals_SHAP = explainer_SHAP.shap_values(X_SHAP_dense)
-        shap_vals_P_SHAP = explainer_P_SHAP.shap_values(X_P_SHAP_dense)
-        # Ensure outputs are numpy arrays (for single-output XGB, shap returns an array directly)
-        shap_vals_base = np.array(shap_vals_base[0] if isinstance(shap_vals_base, list) else shap_vals_base)
-        shap_vals_P = np.array(shap_vals_P[0] if isinstance(shap_vals_P, list) else shap_vals_P)
-        shap_vals_SHAP = np.array(shap_vals_SHAP[0] if isinstance(shap_vals_SHAP, list) else shap_vals_SHAP)
-        shap_vals_P_SHAP = np.array(shap_vals_P_SHAP[0] if isinstance(shap_vals_P_SHAP, list) else shap_vals_P_SHAP)
+        # Train second-stage models on full training data with tuned params
+        model_P = XGBRegressor(**best_params_P, random_state=42)
+        model_SHAP = XGBRegressor(**best_params_SHAP, random_state=42)
+        model_P_SHAP = XGBRegressor(**best_params_P_SHAP, random_state=42)
+        model_P.fit(X_aug_P, y, verbose=False)
+        model_SHAP.fit(X_aug_SHAP, y, verbose=False)
+        model_P_SHAP.fit(X_aug_P_SHAP, y, verbose=False)
 
-        # ---- 5. Aggregate SHAP values from ensemble (average contributions of original features)
-        phi_base = shap_vals_base.mean(axis=0)               # shap contributions from base model
-        phi_P = shap_vals_P[:, :M].mean(axis=0)              # contributions from original features in P model
-        phi_SHAP = shap_vals_SHAP[:, :M].mean(axis=0)        # contributions from original features in SHAP model
-        phi_P_SHAP = shap_vals_P_SHAP[:, :M].mean(axis=0)    # contributions from original features in P+SHAP model
-        phi_mean = (phi_base + phi_P + phi_SHAP + phi_P_SHAP) / 4.0  # ensemble average contribution
+        # --- Compute SHAP values for each second-stage model on the training set ---
+        expl_P = shap.TreeExplainer(model_P)
+        expl_SHAP = shap.TreeExplainer(model_SHAP)
+        expl_P_SHAP = shap.TreeExplainer(model_P_SHAP)
+        X_train_dense = X  # original training features (already dense numpy array)
+        shap_vals_P = expl_P.shap_values(np.hstack([X_train_dense, oof_preds_feat]))
+        shap_vals_SHAP = expl_SHAP.shap_values(np.hstack([X_train_dense, oof_shap]))
+        shap_vals_P_SHAP = expl_P_SHAP.shap_values(np.hstack([X_train_dense, oof_preds_feat, oof_shap]))
 
-        # ---- 6. Normalize Shapley values (min shift, optional power, then L1 normalize to sum=1)
+        # Each shap_vals_* has shape (n_samples, num_features_of_model)
+        # We only care about the contributions for original token features (the first M columns in each augmented set)
+        phi_mean_P = np.array(shap_vals_P)[:, :M].mean(axis=0)
+        phi_mean_SHAP = np.array(shap_vals_SHAP)[:, :M].mean(axis=0)
+        phi_mean_P_SHAP = np.array(shap_vals_P_SHAP)[:, :M].mean(axis=0)
+        # Average token contributions across the three models
+        phi_mean_ensemble = (phi_mean_P + phi_mean_SHAP + phi_mean_P_SHAP) / 3.0
+
+        # Map back to token keys (e.g., "token_1") and normalize the values
+        shapley_values_raw = {f"{samples[i]}_{i+1}": float(phi_mean_ensemble[i]) for i in range(M)}
+
         def normalize_shapley_values(values: Dict[str, float], power: float = 1.0) -> Dict[str, float]:
             min_value = min(values.values()) if values else 0.0
             shifted = {k: v - min_value for k, v in values.items()}
@@ -416,10 +445,9 @@ class BaseSHAP(ABC):
             tot = sum(powered.values())
             if tot == 0:
                 n = max(len(powered), 1)
-                return {k: 1.0 / n for k, v in powered.items()}
+                return {k: 1.0 / n for k in powered}
             return {k: v / tot for k, v in powered.items()}
 
-        shapley_values_raw = {f"{samples[i]}_{i+1}": float(phi_mean[i]) for i in range(M)}
         return normalize_shapley_values(shapley_values_raw)
 
     @abstractmethod
