@@ -109,7 +109,7 @@ class ModelBase(ABC):
         self.client = None
         
     @abstractmethod
-    def generate(self, prompt: str, image_path: Optional[str] = None) -> str:
+    def generate(self, prompt: str) -> str:
         """Generate response from model"""
         pass
 
@@ -132,13 +132,12 @@ class OllamaModel(ModelBase):
     def __init__(self, model_name: str, api_url: str):
         super().__init__(model_name, api_url=api_url)
     
-    def generate(self, prompt: str, image_path: Optional[str] = None) -> str:
+    def generate(self, prompt: str) -> str:
         # Note: Implement the interact_with_ollama function from your original code
         # Add PLACEHOLDER comment to keep existing implementation
         text_response, _ = interact_with_ollama(
             model=self.model_name,
             prompt=prompt,
-            image_path=image_path,
             api_url=self.api_url,
             output_handler=lambda o: o
         )
