@@ -13,6 +13,7 @@ import random
 import base64
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
 
 def default_output_handler(message: str) -> None:
     """Prints messages without newline."""
@@ -125,6 +126,19 @@ class TfidfTextVectorizer(TextVectorizer):
         return cosine_similarity(
             base_vector.reshape(1, -1), comparison_vectors
         ).flatten()
+
+class EmbeddingVectorizer(TextVectorizer):
+    def __init__(self, model_name: str = 'paraphrase-multilingual-mpnet-base-v2'):
+        self.model = SentenceTransformer(model_name)
+    def vectorize(self, texts: List[str]) -> np.ndarray:
+        # Encode texts into semantic embeddings
+        embeddings = self.model.encode(texts, show_progress_bar=False)
+        return np.array(embeddings)
+    def calculate_similarity(self, base_vector: np.ndarray, comparison_vectors: np.ndarray) -> np.ndarray:
+        # Use cosine similarity on embeddings
+        sims = cosine_similarity(base_vector.reshape(1, -1), comparison_vectors).flatten()
+        return sims
+
 
 class OllamaModel(ModelBase):
     """Ollama model implementation supporting both text and vision"""

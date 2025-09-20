@@ -6,7 +6,7 @@ import numpy as np
 import re
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from base import BaseSHAP, TextVectorizer, ModelBase, TfidfTextVectorizer, OllamaModel
+from base import BaseSHAP, TextVectorizer, ModelBase, TfidfTextVectorizer, OllamaModel, EmbeddingVectorizer
 
 class ReasoningStep:
     """Represents a single step in reasoning process"""
@@ -64,32 +64,64 @@ class ReasoningSHAP(BaseSHAP):
         return f"steps_{','.join(map(str, step_nums))}_indexes_{','.join(map(str, indexes))}"
     
     def generate_reasoning_steps(self, problem: str, num_steps: int = 5) -> List[ReasoningStep]:
-        """Generate reasoning steps for a problem using the model"""
+        """Generate reasoning steps for a problem using Phi4 reasoning model with <think> tags"""
         self.problem_statement = problem
-        
-        prompt = (f"Problem: {problem}\n\n"
-                 f"Please solve this problem in exactly {num_steps} clear, logical steps. "
-                 f"Format each step as:\n"
-                 f"Step [number]: [brief description]\n"
-                 f"[detailed reasoning]\n")
-        
+
+        # Prompt designed for Phi4 reasoning to generate structured thinking
+        prompt = (f"Please solve this problem step by step. Show your reasoning process in <think> tags:\n\n"
+                 f"Problem: {problem}\n\n"
+                 f"Please think through this problem carefully and provide exactly {num_steps} clear steps. "
+                 f"Use <think> tags to show your reasoning process, then format your final answer as steps.")
+
         response = self.model.generate(prompt)
         return self._parse_reasoning_response(response)
     
     def _parse_reasoning_response(self, response: str) -> List[ReasoningStep]:
-        """Parse model response into ReasoningStep objects"""
+        """Parse model response into ReasoningStep objects, extracting from <think> tags"""
         steps = []
-        
-        # Simple parsing - split by "Step" pattern
-        step_pattern = r'Step\s+(\d+):\s*([^\n]+)\n((?:(?!Step\s+\d+:).)*)'
-        matches = re.finditer(step_pattern, response, re.DOTALL)
-        
-        for match in matches:
-            step_num = int(match.group(1))
-            description = match.group(2).strip()
-            content = match.group(3).strip()
-            steps.append(ReasoningStep(step_num, description, content))
-            
+
+        # First try to extract content from <think> tags
+        think_pattern = r'<think>(.*?)</think>'
+        think_matches = re.findall(think_pattern, response, re.DOTALL)
+
+        if think_matches:
+            # Parse reasoning from think tags
+            think_content = ' '.join(think_matches)
+            # Look for step patterns within think content or after think tags
+            full_content = think_content + "\n" + response
+        else:
+            # Fallback to original response if no think tags found
+            full_content = response
+
+        # Parse steps from the content - try multiple patterns
+        step_patterns = [
+            r'Step\s+(\d+):\s*([^\n]+)\n((?:(?!Step\s+\d+:).)*)',  # Original pattern
+            r'(\d+)\.\s*([^\n]+)\n((?:(?!\d+\.).)*)',              # Numbered list pattern
+            r'Step\s+(\d+):\s*([^\n]+)(.*?)(?=Step\s+\d+:|$)',     # Lookahead pattern
+        ]
+
+        for pattern in step_patterns:
+            matches = re.finditer(pattern, full_content, re.DOTALL)
+            for match in matches:
+                step_num = int(match.group(1))
+                description = match.group(2).strip()
+                content = match.group(3).strip() if len(match.groups()) > 2 else description
+
+                # Avoid duplicate steps
+                if not any(s.step_number == step_num for s in steps):
+                    steps.append(ReasoningStep(step_num, description, content))
+
+            if steps:  # If we found steps with this pattern, use them
+                break
+
+        # If no structured steps found, create steps from sentences/paragraphs
+        if not steps:
+            self._debug_print("No structured steps found, creating from content")
+            sentences = [s.strip() for s in full_content.split('.') if s.strip()]
+            for i, sentence in enumerate(sentences[:5], 1):  # Limit to 5 steps
+                if sentence:
+                    steps.append(ReasoningStep(i, f"Reasoning step {i}", sentence))
+
         self.reasoning_steps = steps
         return steps
     
@@ -179,7 +211,7 @@ class ReasoningSHAP(BaseSHAP):
                 if step:
                     print(f"\nStep {step_num}: {step.description}")
                     print(f"Shapley Value: {value:.4f}")
-                    print(f"Content: {step.content[:100]}...")
+                    print(f"Content: {step.content}")
         
         print("\n" + "="*60)
     
@@ -221,7 +253,8 @@ def main():
     model_name = 'phi4-reasoning:latest'  # or any model you have in Ollama
     
     # Initialize components
-    vectorizer = TfidfTextVectorizer()
+    #vectorizer = TfidfTextVectorizer()
+    vectorizer = EmbeddingVectorizer(model_name='all-MiniLM-L6-v2')  # Example embedding model
     model = OllamaModel(model_name=model_name, api_url=api_url)
     
     # Create analyzer
@@ -238,42 +271,10 @@ def main():
     The distance between the stations is 280 miles.
     At what time will the trains meet?
     """
-    
-    # You can provide manual steps or let it auto-generate
-    manual_steps = [
-        ReasoningStep(1, "Define variables", 
-                     "Let t = time in hours after 9:00 AM when trains meet"),
-        ReasoningStep(2, "Calculate Train A's distance",
-                     "Train A travels for t hours at 60 mph, covering 60t miles"),
-        ReasoningStep(3, "Calculate Train B's distance",
-                     "Train B starts 1 hour later, travels (t-1) hours at 80 mph, covering 80(t-1) miles"),
-        ReasoningStep(4, "Set up equation",
-                     "Total distance = 280 miles, so: 60t + 80(t-1) = 280"),
-        ReasoningStep(5, "Solve equation",
-                     "60t + 80t - 80 = 280; 140t = 360; t = 2.57 hours = 11:34 AM")
-    ]
-    
-    # Run analysis with manual steps
-    print("Analyzing with manual steps...")
+
+    # Use Phi4 reasoning to auto-generate steps with <think> tags
+    print("Analyzing with Phi4 auto-generated reasoning steps...")
     results = analyzer.analyze_reasoning(
-        problem=problem,
-        steps=manual_steps,
-        sampling_ratio=0.1,
-        max_combinations=50
-    )
-    
-    # Plot results
-    analyzer.plot_importance()
-    
-    # Or run with auto-generated steps
-    print("\n\nAnalyzing with auto-generated steps...")
-    analyzer2 = ReasoningSHAP(
-        model=model,
-        vectorizer=vectorizer,
-        debug=False
-    )
-    
-    results2 = analyzer2.analyze_reasoning(
         problem=problem,
         steps=None,
         auto_generate_steps=True,
@@ -281,7 +282,10 @@ def main():
         sampling_ratio=0.1,
         max_combinations=50
     )
-    
+
+    # Plot results
+    analyzer.plot_importance()
+
     # Save results
     analyzer.save_results("reasoning_analysis_results")
 
