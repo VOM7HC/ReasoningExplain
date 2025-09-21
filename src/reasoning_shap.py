@@ -6,7 +6,7 @@ import numpy as np
 import re
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
-from base import BaseSHAP, TextVectorizer, ModelBase, TfidfTextVectorizer, OllamaModel, EmbeddingVectorizer
+from base import BaseSHAP, TextVectorizer, ModelBase, TfidfTextVectorizer, OllamaModel, EmbeddingVectorizer, TransformerVectorizer
 
 class ReasoningStep:
     """Represents a single step in reasoning process"""
@@ -250,11 +250,12 @@ def main():
     
     # Set up Ollama API
     api_url = os.getenv('API_URL', 'http://localhost:11434')
-    model_name = 'phi4-reasoning:latest'  # or any model you have in Ollama
+    model_name = 'qwen3:4b'  # or any model you have in Ollama
     
     # Initialize components
     #vectorizer = TfidfTextVectorizer()
-    vectorizer = EmbeddingVectorizer(model_name='all-MiniLM-L6-v2')  # Example embedding model
+    #vectorizer = EmbeddingVectorizer(model_name='all-MiniLM-L6-v2')  # Example embedding model
+    vectorizer = TransformerVectorizer(model_name='Qwen/Qwen3:4b')  # Using the same model for embeddings
     model = OllamaModel(model_name=model_name, api_url=api_url)
     
     # Create analyzer

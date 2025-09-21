@@ -14,6 +14,8 @@ import base64
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel, GPTQConfig
+import torch
 
 def default_output_handler(message: str) -> None:
     """Prints messages without newline."""
@@ -136,6 +138,35 @@ class EmbeddingVectorizer(TextVectorizer):
         return np.array(embeddings)
     def calculate_similarity(self, base_vector: np.ndarray, comparison_vectors: np.ndarray) -> np.ndarray:
         # Use cosine similarity on embeddings
+        sims = cosine_similarity(base_vector.reshape(1, -1), comparison_vectors).flatten()
+        return sims
+
+class TransformerVectorizer(TextVectorizer):
+    def __init__(self, model_name: str = 'Qwen/Qwen3-4b'):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(
+            model_name,
+            device_map="cuda:0" if torch.cuda.is_available() else "cpu"
+        )
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
+    
+    def vectorize(self, texts: List[str]) -> np.ndarray:
+            inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+            
+            # Mean pooling
+            attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(outputs.last_hidden_state.size())
+            sum_embeddings = torch.sum(outputs.last_hidden_state * attention_mask, dim=1)
+            sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
+            embeddings = sum_embeddings / sum_mask
+            
+            return embeddings.cpu().numpy()
+    
+    def calculate_similarity(self, base_vector: np.ndarray, comparison_vectors: np.ndarray) -> np.ndarray:
         sims = cosine_similarity(base_vector.reshape(1, -1), comparison_vectors).flatten()
         return sims
 
