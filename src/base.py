@@ -25,7 +25,7 @@ def interact_with_ollama(
     prompt: Optional[str] = None, 
     messages: Optional[Any] = None,
     image_path: Optional[str] = None,
-    model: str = 'openhermes2.5-mistral', 
+    model: str = 'qwen3:1.7b', 
     stream: bool = False, 
     output_handler: Callable[[str], None] = default_output_handler,
     api_url: Optional[str] = None
@@ -142,29 +142,74 @@ class EmbeddingVectorizer(TextVectorizer):
         return sims
 
 class TransformerVectorizer(TextVectorizer):
-    def __init__(self, model_name: str = 'Qwen/Qwen3-4b'):
+    def __init__(self, model_name: str = 'Qwen/Qwen3-1.7b', batch_size: int = 8, use_fp16: bool = True):
+        """
+        Initialize TransformerVectorizer with memory optimization
+
+        Args:
+            model_name: Name of the transformer model
+            batch_size: Batch size for processing texts (reduce if OOM)
+            use_fp16: Use float16 precision to reduce memory usage
+        """
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.batch_size = batch_size
+        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+
+        # Load model with memory optimizations
         self.model = AutoModel.from_pretrained(
             model_name,
-            device_map="cuda:0" if torch.cuda.is_available() else "cpu"
+            device_map="cuda:0" if torch.cuda.is_available() else "cpu",
+            torch_dtype=torch.float16 if self.use_fp16 else torch.float32,
+            low_cpu_mem_usage=True
         )
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
-    
+        self.model.eval()  # Set to evaluation mode
+
     def vectorize(self, texts: List[str]) -> np.ndarray:
-            inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors='pt', max_length=512)
+        """
+        Vectorize texts with batching to reduce memory usage
+
+        Args:
+            texts: List of texts to vectorize
+
+        Returns:
+            Numpy array of embeddings
+        """
+        all_embeddings = []
+
+        # Process in batches to avoid OOM
+        for i in range(0, len(texts), self.batch_size):
+            batch_texts = texts[i:i + self.batch_size]
+
+            inputs = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                return_tensors='pt',
+                max_length=512
+            )
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
+
             with torch.no_grad():
                 outputs = self.model(**inputs)
-            
+
             # Mean pooling
             attention_mask = inputs['attention_mask'].unsqueeze(-1).expand(outputs.last_hidden_state.size())
             sum_embeddings = torch.sum(outputs.last_hidden_state * attention_mask, dim=1)
             sum_mask = torch.clamp(attention_mask.sum(dim=1), min=1e-9)
             embeddings = sum_embeddings / sum_mask
-            
-            return embeddings.cpu().numpy()
+
+            # Move to CPU and convert to numpy immediately
+            batch_embeddings = embeddings.cpu().numpy()
+            all_embeddings.append(batch_embeddings)
+
+            # Clear CUDA cache to free memory
+            if torch.cuda.is_available():
+                del inputs, outputs, embeddings, attention_mask, sum_embeddings, sum_mask
+                torch.cuda.empty_cache()
+
+        return np.vstack(all_embeddings)
     
     def calculate_similarity(self, base_vector: np.ndarray, comparison_vectors: np.ndarray) -> np.ndarray:
         sims = cosine_similarity(base_vector.reshape(1, -1), comparison_vectors).flatten()
