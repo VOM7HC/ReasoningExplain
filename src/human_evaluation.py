@@ -421,7 +421,7 @@ class Study2_TrustReliance:
             'time_taken': ['mean', 'std']
         })
         
-        # Calculate effect sizes
+        # Calculate and store effect sizes separately
         if df['show_explanation'].nunique() > 1:
             with_exp = df[df['show_explanation'] == True]
             without_exp = df[df['show_explanation'] == False]
@@ -434,7 +434,16 @@ class Study2_TrustReliance:
             d_accuracy = (with_exp['correct_final'].mean() - without_exp['correct_final'].mean()) / \
                         np.sqrt((with_exp['correct_final'].var() + without_exp['correct_final'].var()) / 2)
             
-            summary.loc['effect_sizes'] = [d_trust, d_accuracy]
+            # Store effect sizes as a class attribute
+            self.effect_sizes = {
+                'trust_score_cohens_d': d_trust,
+                'accuracy_cohens_d': d_accuracy
+            }
+            
+            # Optionally print the effect sizes
+            print(f"\nEffect Sizes (Cohen's d):")
+            print(f"  Trust Score: {d_trust:.3f}")
+            print(f"  Accuracy: {d_accuracy:.3f}")
         
         return summary
     
