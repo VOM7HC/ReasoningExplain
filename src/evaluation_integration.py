@@ -42,8 +42,56 @@ CONFIG = {
     'output_dir': 'thesis_evaluation_results',
     'sampling_ratio': 0.3,
     'max_combinations': 100,
-    'use_transformer_vectorizer': True  # Set to True to use TransformerVectorizer
+    'use_transformer_vectorizer': True,  # Set to True to use TransformerVectorizer
+    # Real data paths (REQUIRED - no fallback to simulated data)
+    'study1_data_path': 'xai_datasets/study1_explainable_emotions.csv',
+    'study2_data_path': 'xai_datasets/study2_synthetic_template.csv',  # or study2_decision_logs.csv
+    'study3_data_path': 'xai_datasets/study3_synthetic_template.csv',
 }
+
+def load_real_evaluation_data(config: Dict) -> Dict:
+    """
+    Load real evaluation data from CSV files
+
+    This function requires real data and will raise an error if data files are not found.
+
+    Args:
+        config: Configuration dictionary with data paths
+
+    Returns:
+        Dictionary with loaded dataframes for each study
+
+    Raises:
+        FileNotFoundError: If required CSV files are not found
+        ValueError: If config is missing required paths
+    """
+    # Validate config
+    required_keys = ['study1_data_path', 'study2_data_path', 'study3_data_path']
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise ValueError(f"❌ Config missing required keys: {missing_keys}")
+
+    data = {}
+
+    # Load Study 1 data
+    if not os.path.exists(config['study1_data_path']):
+        raise FileNotFoundError(f"❌ Study 1 data file not found: {config['study1_data_path']}")
+    data['study1'] = pd.read_csv(config['study1_data_path'])
+    print(f"✓ Loaded Study 1 data: {len(data['study1'])} rows from {config['study1_data_path']}")
+
+    # Load Study 2 data
+    if not os.path.exists(config['study2_data_path']):
+        raise FileNotFoundError(f"❌ Study 2 data file not found: {config['study2_data_path']}")
+    data['study2'] = pd.read_csv(config['study2_data_path'])
+    print(f"✓ Loaded Study 2 data: {len(data['study2'])} rows from {config['study2_data_path']}")
+
+    # Load Study 3 data
+    if not os.path.exists(config['study3_data_path']):
+        raise FileNotFoundError(f"❌ Study 3 data file not found: {config['study3_data_path']}")
+    data['study3'] = pd.read_csv(config['study3_data_path'])
+    print(f"✓ Loaded Study 3 data: {len(data['study3'])} rows from {config['study3_data_path']}")
+
+    return data
 
 def initialize_tokenshap(config: Dict) -> TokenSHAP:
     """
@@ -157,17 +205,23 @@ def prepare_test_data() -> Dict:
         'counterfactual_pairs': winobias_pairs
     }
 
-def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str):
+def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str, real_data: pd.DataFrame = None):
     """
     Run Study 1: Explanation Quality Assessment
+
+    Args:
+        token_shap: TokenSHAP instance
+        samples: Test samples
+        output_dir: Output directory
+        real_data: DataFrame with real evaluation data (optional)
     """
     print("\n" + "="*60)
     print("STUDY 1: EXPLANATION QUALITY ASSESSMENT")
     print("="*60)
-    
+
     framework = HumanEvaluationFramework(output_dir)
     study1 = Study1_ExplanationQuality(framework)
-    
+
     # Process samples with different methods for comparison
     methods_to_compare = {
         'TokenSHAP': token_shap,
@@ -175,13 +229,19 @@ def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
         # 'LIME': lime_instance,
         # 'Attention': attention_instance
     }
-    
-    # Simulate participant pool (in real study, these would be actual participants)
-    participants = [f"participant_{i:03d}" for i in range(50)]
-    
+
+    # Require real data
+    if real_data is None or real_data.empty:
+        raise ValueError("❌ Study 1 requires real evaluation data. Please provide study1_data_path in CONFIG.")
+
+    print(f"✓ Using real evaluation data from CSV ({len(real_data)} rows)")
+    # Group by participant for realistic data usage
+    participants = real_data['participant_id'].unique().tolist()
+    print(f"  Found {len(participants)} unique participants")
+
     for sample_idx, sample in enumerate(samples[:5], 1):
         print(f"\nProcessing sample {sample_idx}/{min(5, len(samples))}: {sample['text'][:50]}...")
-        
+
         for method_name, method_instance in methods_to_compare.items():
             # Generate explanation
             if method_name == 'TokenSHAP':
@@ -194,7 +254,7 @@ def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
             else:
                 # Placeholder for other methods
                 shapley_values = {}
-            
+
             # Create evaluation template
             eval_template = study1.create_evaluation_interface(
                 text=sample['text'],
@@ -202,20 +262,31 @@ def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
                 shapley_values=shapley_values,
                 method_name=method_name
             )
-            
-            # Collect ratings from participants
-            # In real study, this would be actual human ratings
-            for participant in participants[:30]:
-                # Simulate ratings (replace with actual collection)
-                ratings = {
-                    'understandability': np.random.randint(3, 6),
-                    'completeness': np.random.randint(3, 6),
-                    'usefulness': np.random.randint(3, 6),
-                    'trustworthiness': np.random.randint(3, 6),
-                    'actionability': np.random.randint(3, 6),
-                    'sufficiency': np.random.randint(3, 6)
-                }
-                study1.collect_ratings(participant, eval_template, ratings)
+
+            # Use real ratings from CSV
+            # Sample up to 30 participants for this evaluation
+            sample_participants = participants[:min(30, len(participants))]
+
+            for participant in sample_participants:
+                # Get ratings from real data for this participant
+                participant_data = real_data[real_data['participant_id'] == participant]
+
+                if len(participant_data) > 0:
+                    # Use random row for this participant
+                    row = participant_data.iloc[np.random.randint(0, len(participant_data))]
+
+                    ratings = {
+                        'understandability': int(row['understandability']),
+                        'completeness': int(row['completeness']),
+                        'usefulness': int(row['usefulness']),
+                        'trustworthiness': int(row['trustworthiness']),
+                        'actionability': int(row['actionability']),
+                        'sufficiency': int(row['sufficiency'])
+                    }
+
+                    study1.collect_ratings(participant, eval_template, ratings)
+                else:
+                    print(f"  ⚠ Warning: No data found for participant {participant}, skipping...")
     
     # Analyze results
     summary = study1.analyze_results()
@@ -238,23 +309,34 @@ def run_study1_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
     
     return study1.results
 
-def run_study2_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str):
+def run_study2_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str, real_data: pd.DataFrame = None):
     """
     Run Study 2: Trust and Reliance Measurement
+
+    Args:
+        token_shap: TokenSHAP instance
+        samples: Test samples
+        output_dir: Output directory
+        real_data: DataFrame with real decision data (optional)
     """
     print("\n" + "="*60)
     print("STUDY 2: TRUST AND RELIANCE MEASUREMENT")
     print("="*60)
-    
+
     framework = HumanEvaluationFramework(output_dir)
     study2 = Study2_TrustReliance(framework)
-    
-    # Simulate participant pool
-    participants = [f"participant_{i:03d}" for i in range(100)]
-    
+
+    # Require real data
+    if real_data is None or real_data.empty:
+        raise ValueError("❌ Study 2 requires real decision data. Please provide study2_data_path in CONFIG.")
+
+    print(f"✓ Using real decision data from CSV ({len(real_data)} rows)")
+    participants = real_data['participant_id'].unique().tolist()
+    print(f"  Found {len(participants)} unique participants")
+
     for sample_idx, sample in enumerate(samples[:10], 1):
         print(f"\nProcessing sample {sample_idx}/{min(10, len(samples))}: {sample['text'][:50]}...")
-        
+
         # Test with and without explanations
         for show_explanation in [True, False]:
             # Generate explanation if needed
@@ -267,7 +349,7 @@ def run_study2_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
                 shapley_values = token_shap.shapley_values
             else:
                 shapley_values = None
-            
+
             # Create decision task
             task = study2.create_decision_task(
                 text=sample['text'],
@@ -277,29 +359,34 @@ def run_study2_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
                 shapley_values=shapley_values,
                 show_explanation=show_explanation
             )
-            
-            # Collect decisions from participants
-            # In real study, this would be actual human decisions
-            for participant in participants[:50]:
-                # Simulate decision process (replace with actual collection)
-                initial_decision = np.random.choice(['positive', 'negative'])
-                
-                # Simulate influence of AI suggestion
-                if np.random.random() < task['model_confidence']:
-                    final_decision = task['model_suggestion']
+
+            # Use real decision data from CSV
+            sample_participants = participants[:min(50, len(participants))]
+
+            for participant in sample_participants:
+                # Get data for this participant
+                participant_data = real_data[real_data['participant_id'] == participant]
+
+                if len(participant_data) > 0:
+                    # Use random row for this participant
+                    row = participant_data.iloc[np.random.randint(0, len(participant_data))]
+
+                    # Extract decisions and trust ratings
+                    initial_decision = str(row['initial_decision'])
+                    final_decision = str(row['final_decision'])
+
+                    # Extract 12 trust items
+                    trust_ratings = [int(row[f'trust_item_{i}']) for i in range(1, 13)]
+
+                    # Extract time taken
+                    time_taken = float(row['time_taken'])
+
+                    study2.collect_decision(
+                        participant, task, initial_decision,
+                        final_decision, trust_ratings, time_taken
+                    )
                 else:
-                    final_decision = initial_decision
-                
-                # Simulate trust ratings (1-7 scale, 12 items)
-                trust_ratings = [np.random.randint(4, 8) for _ in range(12)]
-                
-                # Simulate decision time
-                time_taken = np.random.uniform(10, 60)
-                
-                study2.collect_decision(
-                    participant, task, initial_decision,
-                    final_decision, trust_ratings, time_taken
-                )
+                    print(f"  ⚠ Warning: No data found for participant {participant}, skipping...")
     
     # Analyze results
     summary = study2.analyze_results()
@@ -317,23 +404,34 @@ def run_study2_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
     
     return study2.results
 
-def run_study3_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str):
+def run_study3_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir: str, real_data: pd.DataFrame = None):
     """
     Run Study 3: Bias Detection Task
+
+    Args:
+        token_shap: TokenSHAP instance
+        samples: Test samples
+        output_dir: Output directory
+        real_data: DataFrame with real bias detection data (optional)
     """
     print("\n" + "="*60)
     print("STUDY 3: BIAS DETECTION TASK")
     print("="*60)
-    
+
     framework = HumanEvaluationFramework(output_dir)
     study3 = Study3_BiasDetection(framework)
-    
-    # Simulate participant pool
-    participants = [f"participant_{i:03d}" for i in range(40)]
-    
+
+    # Require real data
+    if real_data is None or real_data.empty:
+        raise ValueError("❌ Study 3 requires real bias detection data. Please provide study3_data_path in CONFIG.")
+
+    print(f"✓ Using real bias detection data from CSV ({len(real_data)} rows)")
+    participants = real_data['participant_id'].unique().tolist()
+    print(f"  Found {len(participants)} unique participants")
+
     for sample_idx, sample in enumerate(samples, 1):
         print(f"\nProcessing sample {sample_idx}/{len(samples)}: {sample['text'][:50]}...")
-        
+
         # Test with and without explanations
         for show_explanation in [True, False]:
             # Generate explanation if needed
@@ -346,7 +444,7 @@ def run_study3_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
                 shapley_values = token_shap.shapley_values
             else:
                 shapley_values = None
-            
+
             # Create bias detection task
             task = study3.create_bias_detection_task(
                 text=sample['text'],
@@ -357,27 +455,30 @@ def run_study3_evaluation(token_shap: TokenSHAP, samples: List[Dict], output_dir
                 show_explanation=show_explanation,
                 protected_tokens=sample.get('protected_tokens', [])
             )
-            
-            # Collect detection responses from participants
-            # In real study, this would be actual human responses
-            for participant in participants[:20]:
-                # Simulate detection (replace with actual collection)
-                # Participants with explanations detect bias more accurately
-                if show_explanation and task['is_biased']:
-                    detected_bias = np.random.choice([True, False], p=[0.75, 0.25])
-                elif show_explanation and not task['is_biased']:
-                    detected_bias = np.random.choice([True, False], p=[0.2, 0.8])
+
+            # Use real bias detection data from CSV
+            sample_participants = participants[:min(20, len(participants))]
+
+            for participant in sample_participants:
+                # Get data for this participant
+                participant_data = real_data[real_data['participant_id'] == participant]
+
+                if len(participant_data) > 0:
+                    # Use random row for this participant
+                    row = participant_data.iloc[np.random.randint(0, len(participant_data))]
+
+                    # Extract bias detection data
+                    detected_bias = bool(row['detected_bias'])
+                    confidence = int(row['confidence'])
+                    identified_type = row['identified_type'] if pd.notna(row['identified_type']) else None
+                    time_taken = float(row['time_taken'])
+
+                    study3.collect_detection(
+                        participant, task, detected_bias,
+                        confidence, identified_type, time_taken
+                    )
                 else:
-                    detected_bias = np.random.choice([True, False])
-                
-                confidence = np.random.randint(2, 6)
-                identified_type = np.random.choice(['gender', 'race', 'age', None])
-                time_taken = np.random.uniform(15, 90)
-                
-                study3.collect_detection(
-                    participant, task, detected_bias,
-                    confidence, identified_type, time_taken
-                )
+                    print(f"  ⚠ Warning: No data found for participant {participant}, skipping...")
     
     # Analyze results
     summary, cm, report, metrics = study3.analyze_results()
@@ -525,40 +626,49 @@ def main():
     print("TOKENSHAP THESIS EVALUATION SUITE")
     print("="*60)
     print(f"Starting evaluation at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     # Create output directory
     os.makedirs(CONFIG['output_dir'], exist_ok=True)
-    
+
+    # Load real evaluation data
+    print("\n" + "="*60)
+    print("LOADING REAL EVALUATION DATA")
+    print("="*60)
+    real_eval_data = load_real_evaluation_data(CONFIG)
+
     # Initialize TokenSHAP
     token_shap = initialize_tokenshap(CONFIG)
-    
+
     # Prepare test data
     test_data = prepare_test_data()
-    
+
     # Store all results
     all_results = {}
-    
+
     # Run Study 1: Explanation Quality
     study1_results = run_study1_evaluation(
         token_shap,
         test_data['general_samples'],
-        CONFIG['output_dir']
+        CONFIG['output_dir'],
+        real_data=real_eval_data.get('study1')
     )
     all_results['study1'] = study1_results
-    
+
     # Run Study 2: Trust and Reliance
     study2_results = run_study2_evaluation(
         token_shap,
         test_data['general_samples'],
-        CONFIG['output_dir']
+        CONFIG['output_dir'],
+        real_data=real_eval_data.get('study2')
     )
     all_results['study2'] = study2_results
-    
+
     # Run Study 3: Bias Detection Task
     study3_results = run_study3_evaluation(
         token_shap,
         test_data['bias_samples'],
-        CONFIG['output_dir']
+        CONFIG['output_dir'],
+        real_data=real_eval_data.get('study3')
     )
     all_results['study3'] = study3_results
     
